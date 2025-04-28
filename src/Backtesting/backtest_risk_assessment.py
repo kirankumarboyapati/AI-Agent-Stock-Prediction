@@ -12,176 +12,187 @@ import logging
 import backtrader as bt
 import pandas as pd
 import numpy as np
-import os
 import sys
+import json
 
+# ensure we can import BaseAgent
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-from src.UI.risk_assessment import (
-    fetch_stock_data,
-    calculate_risk_metrics,
-    calculate_scenario_risk_metrics,
-    analyze_portfolio_breakdown
-)
+from src.Agents.base_agent import BaseAgent
+
+# CrewAI + LLM
+import crewai
+from crewai import Task, Crew, Process
+from langchain_openai import ChatOpenAI
 
 # ------------------------------
-# Backtrader Strategy: Buy & Hold with Risk Metrics
+# Risk Metric Calculator (rolling)
 # ------------------------------
-class RiskBacktestStrategy(bt.Strategy):
-    params = (
-        ('confidence', 0.05),
-    )
+def add_rolling_risk_metrics(df: pd.DataFrame, window: int, confidence: float):
+    df = df.sort_values('date').copy()
+    df['returns'] = df['close'].pct_change()
+    # rolling VaR
+    df['rolling_var'] = df['returns'].rolling(window).quantile(confidence)
+    # rolling volatility
+    df['rolling_volatility'] = df['returns'].rolling(window).std() * np.sqrt(252)
+    # rolling drawdown
+    df['cum_return'] = (1 + df['returns']).cumprod()
+    df['rolling_max'] = df['cum_return'].cummax()
+    df['rolling_drawdown'] = (df['cum_return'] - df['rolling_max']) / df['rolling_max']
+    return df.dropna()
+
+# ------------------------------
+# CrewAI agent for risk-based signals
+# ------------------------------
+class RiskBuySellAgent(BaseAgent):
+    def __init__(self, ticker="AAPL", llm=None, **kwargs):
+        super().__init__(
+            role=f"Risk-based trader for {ticker}",
+            goal="Generate daily BUY/SELL/HOLD signals based on rolling risk metrics",
+            backstory="You are an expert risk-management quant. Use rolling VaR, volatility, and drawdown to decide.",
+            verbose=True,
+            tools=[],
+            allow_delegation=False,
+            llm=llm,
+            **kwargs
+        )
+        self.ticker = ticker
+        logging.info(f"Initialized RiskBuySellAgent for {ticker}")
+
+    def buy_sell_decision(self):
+        return Task(
+            description="""
+The global pandas DataFrame `data` has columns:
+  date, high, low, close,
+  returns, rolling_var, rolling_volatility, rolling_drawdown.
+
+For each row, output exactly one of: BUY, SELL, or HOLD.
+Return **only** a pure JSON object mapping YYYY-MM-DD → BUY/SELL/HOLD,
+with no additional commentary.
+""",
+            agent=self,
+            expected_output="Pure JSON dict mapping YYYY-MM-DD to BUY/SELL/HOLD."
+        )
+
+# single shared LLM
+gpt_llm = ChatOpenAI(model_name="gpt-4o", temperature=0.0, max_tokens=1500)
+
+# ----------------------------------------
+# Rolling Risk Indicator for Backtrader
+# ----------------------------------------
+class RollingRiskBT(bt.Indicator):
+    lines = ('rolling_var', 'rolling_volatility', 'rolling_drawdown',)
+    params = (('window', 20), ('confidence', 0.05),)
+
     def __init__(self):
-        self.trade_log = []
-        self.dates = []
-        self.closes = []
-        self.bought = False
+        self.addminperiod(self.p.window)
+
+    def once(self, start, end):
+        size = len(self.data)
+        df = pd.DataFrame({
+            'high':  [self.data.high[i] for i in range(size)],
+            'low':   [self.data.low[i] for i in range(size)],
+            'close': [self.data.close[i] for i in range(size)],
+            'date':  pd.date_range(end=datetime.today(), periods=size, freq='D')
+        })
+        res = add_rolling_risk_metrics(df, self.p.window, self.p.confidence)
+        for i in range(len(res)):
+            self.lines.rolling_var[i]        = res['rolling_var'].iat[i]
+            self.lines.rolling_volatility[i] = res['rolling_volatility'].iat[i]
+            self.lines.rolling_drawdown[i]   = res['rolling_drawdown'].iat[i]
+
+# ----------------------------------------
+# Strategy driven by CrewAI signals
+# ----------------------------------------
+class RiskStrategy(bt.Strategy):
+    params = (
+        ('allocation', 1.0),
+        ('signals', {}),
+    )
+
+    def __init__(self):
+        self.signals = self.p.signals
 
     def next(self):
-        date = self.datas[0].datetime.date(0)
-        price = self.datas[0].close[0]
-        self.dates.append(date)
-        self.closes.append(price)
+        dt = self.datas[0].datetime.date(0).strftime('%Y-%m-%d')
+        sig = self.signals.get(dt, 'HOLD')
+        price = self.data.close[0]
 
-        if not self.bought:
-            size = int(self.broker.getcash() // price)
-            if size > 0:
+        if sig == 'BUY' and not self.position:
+            size = int((self.broker.getcash() * self.p.allocation) // price)
+            if size:
                 self.buy(size=size)
-                self.trade_log.append(f"{date}: BUY {size} @ {price:.2f}")
-            self.bought = True
+        elif sig == 'SELL' and self.position:
+            self.sell(size=self.position.size)
 
-    def stop(self):
-        # Sell at end if still in position
-        date = self.datas[0].datetime.date(-1)
-        if self.position.size:
-            price = self.datas[0].close[-1]
-            size = self.position.size
-            self.sell(size=size)
-            self.trade_log.append(f"{date}: SELL {size} @ {price:.2f}")
-        # Compute risk metrics
-        df = pd.DataFrame({'date': self.dates, 'close': self.closes})
-        self.risk_metrics, self.risk_data = calculate_risk_metrics(df, self.p.confidence)
-
-# ------------------------------
-# Backtest Runner Function
-# ------------------------------
-def run_backtest(strategy_class, data_feed, cash=10000, commission=0.001, confidence=0.05):
+# ----------------------------------------
+# Backtest runner
+# ----------------------------------------
+def run_backtest(strategy_class, data_feed, cash=10000, commission=0.001, **kwargs):
     cerebro = bt.Cerebro()
-    cerebro.addstrategy(strategy_class, confidence=confidence)
+    cerebro.addstrategy(strategy_class, **kwargs)
     cerebro.adddata(data_feed)
     cerebro.broker.setcash(cash)
     cerebro.broker.setcommission(commission)
-
-    # Add analyzers
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.01)
-    cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
+    cerebro.addanalyzer(bt.analyzers.Returns,     _name='returns')
+    cerebro.addanalyzer(bt.analyzers.DrawDown,    _name='drawdown')
 
-    logging.info(f"Running {strategy_class.__name__}...")
-    results = cerebro.run()
-    strat = results[0]
-
-    # Performance metrics
-    sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio', np.nan)
-    total_return = strat.analyzers.returns.get_analysis().get('rtot', 0)
-    drawdown = strat.analyzers.drawdown.get_analysis()
-    max_dd = drawdown.get('maxdrawdown', np.nan)
-    trades = strat.analyzers.trades.get_analysis().get('total', {})
-
-    perf_summary = {
-        'Sharpe Ratio': sharpe,
-        'Total Return': total_return,
-        'Max Drawdown': max_dd
+    strat = cerebro.run()[0]
+    r = strat.analyzers.returns.get_analysis()
+    d = strat.analyzers.drawdown.get_analysis()
+    perf = {
+        "Sharpe Ratio":   strat.analyzers.sharpe.get_analysis().get('sharperatio', 0),
+        "Total Return %": r.get('rtot', 0) * 100,
+        "Max Drawdown %": d.get('drawdown', 0) * 100
     }
+    fig = cerebro.plot(iplot=False)[0][0]
+    return perf, strat, fig
 
-    # Risk metrics
-    risk_metrics = strat.risk_metrics
-    # Trade log
-    trade_log = strat.trade_log
-
-    # Chart
-    figs = cerebro.plot(iplot=False, show=False)
-    chart = figs[0][0]
-
-    return perf_summary, risk_metrics, trade_log, chart
-
-# ------------------------------
-# Streamlit App Layout
-# ------------------------------
+# ----------------------------------------
+# Streamlit + CrewAI integration
+# ----------------------------------------
 def main():
-    st.title("Risk Assessment Backtest")
-    st.write(
-        "Backtest a buy-and-hold strategy, compute performance (Sharpe, return, drawdown), "
-        "risk metrics (VaR, volatility), visualize results, simulate shock, and analyze portfolio."
-    )
+    st.title("Risk Assessment Backtest With CrewAI Signals")
 
-    # Sidebar
-    st.sidebar.header("Backtest Parameters")
-    ticker = st.sidebar.text_input("Ticker", "AAPL")
-    period = st.sidebar.selectbox("Period", ["1y", "6mo", "3mo", "1mo"], index=0)
-    confidence = st.sidebar.slider("VaR Confidence", 0.01, 0.1, 0.05, 0.01)
-    shock_pct = st.sidebar.slider("Market Shock (%)", 0.0, 10.0, 0.0, 0.5)
-    portfolio_input = st.sidebar.text_area(
-        "Portfolio (Ticker,Asset Class,Size)", "AAPL,Equity,100\nMSFT,Equity,150"
-    )
-    cash = st.sidebar.number_input("Initial Cash", 10000.0)
-    commission = st.sidebar.number_input("Commission", 0.001, step=0.0001)
+    st.sidebar.header("Parameters")
+    ticker      = st.sidebar.text_input("Ticker", "AAPL")
+    start       = st.sidebar.date_input("Start", datetime(2020, 1, 1))
+    end         = st.sidebar.date_input("End",   datetime.today())
+    window      = st.sidebar.number_input("Risk Window (days)", 20, step=1)
+    confidence  = st.sidebar.slider("VaR Confidence", 0.01, 0.1, 0.05, 0.01)
+    cash        = st.sidebar.number_input("Cash",       10000)
+    comm        = st.sidebar.number_input("Commission", 0.001, step=0.0001)
 
     if st.sidebar.button("Run Backtest"):
-        st.info("Fetching data...")
-        data = fetch_stock_data(ticker, period)
-        if data is None:
-            st.error("Data fetch failed.")
-            return
-        data_feed = bt.feeds.PandasData(dataname=data, datetime='date', close='close')
+        # 1) Fetch data via YahooQuery
+        from yahooquery import Ticker as YQTicker
+        df = YQTicker(ticker).history(period=None, start=start, end=end).reset_index()
+        df['date'] = pd.to_datetime(df['date'], utc=True).dt.tz_convert(None)
 
-        st.info("Running backtest...")
-        perf, risk, trades, chart = run_backtest(
-            RiskBacktestStrategy,
-            data_feed,
-            cash=cash,
-            commission=commission,
-            confidence=confidence
-        )
+        # 2) Add rolling risk metrics
+        risk_df = add_rolling_risk_metrics(df[['date', 'high', 'low', 'close']], window, confidence)
 
-        # Performance
-        st.subheader("Performance Summary")
-        st.write(f"**Sharpe Ratio:** {perf['Sharpe Ratio']:.2f}")
-        st.write(f"**Total Return:** {perf['Total Return']*100:.2f}%")
-        st.write(f"**Max Drawdown:** {perf['Max Drawdown']:.2%}")
+        # 3) Ask CrewAI for signals
+        globals()['data'] = risk_df
+        agent = RiskBuySellAgent(ticker=ticker, llm=gpt_llm)
+        task  = agent.buy_sell_decision()
+        crew  = Crew(agents=[agent], tasks=[task], verbose=True, process=Process.sequential)
+        crew.kickoff()
+        raw     = task.output.raw    # <— use .raw instead of nonexistent .result
+        signals = json.loads(raw)
 
-        # Risk
-        st.subheader("Risk Metrics")
-        st.write(f"**VaR ({confidence*100:.0f}%):** {risk['var']:.2%}")
-        st.write(f"**Volatility:** {risk['volatility']:.2%}")
+        st.subheader("CrewAI Signals (raw JSON)")
+        st.code(raw, language="json")
 
-        # Trades
-        st.subheader("Trade Log")
-        if trades:
-            for t in trades:
-                st.write(t)
-        else:
-            st.write("No trades.")
+        # 4) Backtest
+        feed = bt.feeds.PandasData(dataname=df.set_index('date'), fromdate=start, todate=end)
+        perf, strat, fig = run_backtest(RiskStrategy, feed, cash=cash, commission=comm, signals=signals)
 
-        # Chart
-        st.subheader("Backtest Chart")
-        st.pyplot(chart)
-
-        # Scenario
-        if shock_pct > 0:
-            scene = calculate_scenario_risk_metrics(pd.DataFrame({'date': risk['returns'].index, 'close': risk['returns'].index}), shock_pct/100.0, confidence)
-            st.subheader("Scenario Analysis")
-            st.write(f"**VaR (shock {shock_pct}%):** {scene['var']:.2%}")
-            st.write(f"**Volatility:** {scene['volatility']:.2%}")
-
-        # Portfolio
-        st.subheader("Portfolio Breakdown")
-        details, breakdown = analyze_portfolio_breakdown(portfolio_input, period, confidence)
-        if details is not None:
-            st.dataframe(details)
-            st.dataframe(breakdown)
-        else:
-            st.warning("No portfolio data.")
+        # 5) Display
+        st.subheader("Performance")
+        st.write(perf)
+        st.subheader("Equity Curve")
+        st.pyplot(fig)
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
